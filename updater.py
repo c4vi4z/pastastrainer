@@ -2,7 +2,7 @@ import os, sys, re, json, ssl, zipfile, platform, subprocess, webbrowser
 import urllib.request, urllib.error
 import bot
 
-REPO = "c4vi4z/memorybot"
+REPO = "c4vi4z/pastastrainer"
 FROZEN = getattr(sys, "frozen", False)
 
 try:
@@ -31,7 +31,7 @@ def describe(e):
     if isinstance(e, urllib.error.URLError):
         return "geen internet of certificaat probleem: " + str(e.reason)
     return type(e).__name__ + ": " + str(e)
-    
+
 def latest_release():
     rel = get_json("https://api.github.com/repos/" + REPO + "/releases/latest")
     if num(rel.get("tag_name", "")) > num(bot.APP_VERSION):
