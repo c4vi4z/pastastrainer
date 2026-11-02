@@ -14,3 +14,5 @@ Keep the pasta.
  Lose the water.
 
 A surprisingly elegant solution to a surprisingly recurring problem.
+
+Thank you, my dearest Pasta Strainers. Rise up!
