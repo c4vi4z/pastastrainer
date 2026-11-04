@@ -24,7 +24,7 @@ if not getattr(sys, "frozen", False) and os.path.abspath(sys.prefix) != os.path.
             subprocess.check_call([py_console, "-m", "pip", "install", "--quiet", "selenium"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=noflag)
         sys.exit(subprocess.call([py_run, os.path.abspath(__file__)] + sys.argv[1:]))
 
-import json, queue, threading
+import json, queue, threading, traceback
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -54,6 +54,12 @@ SETTINGS = os.path.join(bot_mod.BASE, "settings.json")
 ICON = os.path.join(bot_mod.RES, "icon.png")
 DEFAULT_URL = "https://VERANDERSCHOOLHIER.memorylab.app"
 
+LIGHT = {"bg": "#f0f0f0", "fg": "#111111", "field": "#ffffff", "btn": "#e1e1e1", "hover": "#d0d0d0", "sel": "#2f6fed", "selfg": "#ffffff", "border": "#a9a9a9", "dim": "#8a8a8a"}
+DARK = {"bg": "#1e1f22", "fg": "#e6e6e6", "field": "#2b2d31", "btn": "#383a40", "hover": "#4a4d55", "sel": "#4f7cff", "selfg": "#ffffff", "border": "#4a4c52", "dim": "#777b85"}
+PAL = dict(LIGHT)
+
+PAIRS = {"delay_min": "delay_max", "delay_max": "delay_min", "wrong_min": "wrong_max", "wrong_max": "wrong_min"}
+
 
 def load_settings():
     try:
@@ -61,6 +67,13 @@ def load_settings():
             return json.load(f)
     except Exception:
         return {}
+
+
+def num(v, default):
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 
 def open_path(path):
@@ -75,6 +88,7 @@ def open_path(path):
 class Ask(tk.Toplevel):
     def __init__(self, parent, text, options=None, entry=False):
         super().__init__(parent)
+        self.configure(bg=PAL["bg"])
         self.title("Memory Bot")
         self.result = None
         self.transient(parent)
@@ -112,13 +126,11 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Memory Bot v" + bot_mod.APP_VERSION)
-        root.geometry("540x740")
-        root.minsize(480, 640)
-        if sys.platform.startswith("linux"):
-            try:
-                ttk.Style().theme_use("clam")
-            except tk.TclError:
-                pass
+        root.geometry("540x790")
+        root.minsize(480, 680)
+
+        self.default_bg = root.cget("bg")
+        self.native_theme = ttk.Style().theme_use()
 
         self.icon = None
         if os.path.exists(ICON):
@@ -134,20 +146,47 @@ class App:
         self.dialog = None
         self.worker = None
         self.update_rel = None
+        self.settings_win = None
+        self.building = False
+        self.sl = {}
         self.settings = load_settings()
+
+        s = self.settings
+        dmin = num(s.get("delay_min"), bot_mod.DELAY_MIN)
+        dmax = num(s.get("delay_max"), bot_mod.DELAY_MAX)
+        if dmin > dmax:
+            dmin, dmax = dmax, dmin
+        wmin = int(num(s.get("wrong_min"), bot_mod.WRONG_MIN))
+        wmax = int(num(s.get("wrong_max"), bot_mod.WRONG_MAX))
+        if wmin > wmax:
+            wmin, wmax = wmax, wmin
+        self.delay_min = tk.DoubleVar(value=dmin)
+        self.delay_max = tk.DoubleVar(value=dmax)
+        self.know_delay = tk.DoubleVar(value=num(s.get("know_delay"), bot_mod.KNOW_DELAY))
+        self.wrong_min = tk.IntVar(value=wmin)
+        self.wrong_max = tk.IntVar(value=wmax)
+        self.dark = tk.BooleanVar(value=bool(s.get("dark", False)))
+        self.apply_options(False)
 
         bot_mod.log = self.log
         bot_mod.ask_open = self.ask_open
         bot_mod.ask_mc = self.ask_mc
         bot_mod.stop = self.stop
+        bot_mod.hook_threads()
+        root.report_callback_exception = self.tk_error
+        bot_mod.debug_info()
 
         self.build_ui()
         self.refresh_lists()
+        self.apply_theme()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.poll()
 
         if updater is not None:
             threading.Thread(target=self.check_updates, args=(True,), daemon=True).start()
+
+    def tk_error(self, exc, val, tb):
+        bot_mod.file_log("tk fout: " + "".join(traceback.format_exception(exc, val, tb)))
 
     def build_ui(self):
         r = self.root
@@ -226,6 +265,12 @@ class App:
         sb3.pack(side="right", fill="y")
         self.logbox.pack(side="left", fill="both", expand=True)
 
+        tools = ttk.Frame(r)
+        tools.pack(fill="x", **pad)
+        ttk.Button(tools, text="Instellingen", command=self.open_settings).pack(side="left")
+        ttk.Button(tools, text="Logmap openen", command=lambda: open_path(bot_mod.PARENT)).pack(side="left", padx=6)
+        ttk.Checkbutton(tools, text="Donkere modus", variable=self.dark, command=self.apply_theme).pack(side="left", padx=6)
+
         if updater is not None:
             upd = ttk.Frame(r)
             upd.pack(fill="x", **pad)
@@ -233,6 +278,124 @@ class App:
             ttk.Label(upd, textvariable=self.upd_text).pack(side="left")
             self.btn_update = ttk.Button(upd, text="Zoek updates", command=self.update_click)
             self.btn_update.pack(side="right")
+
+    def apply_theme(self):
+        dark = bool(self.dark.get())
+        st = ttk.Style()
+        if dark or sys.platform.startswith("linux"):
+            p = DARK if dark else LIGHT
+            st.theme_use("clam")
+            st.configure(".", background=p["bg"], foreground=p["fg"], fieldbackground=p["field"], bordercolor=p["border"], lightcolor=p["bg"], darkcolor=p["bg"], troughcolor=p["field"], insertcolor=p["fg"], arrowcolor=p["fg"])
+            st.configure("TButton", background=p["btn"], foreground=p["fg"], padding=4)
+            st.map("TButton", background=[("disabled", p["bg"]), ("active", p["hover"])], foreground=[("disabled", p["dim"])])
+            st.configure("TEntry", fieldbackground=p["field"], foreground=p["fg"])
+            st.configure("TSpinbox", fieldbackground=p["field"], foreground=p["fg"], background=p["btn"], arrowcolor=p["fg"])
+            st.configure("TCheckbutton", background=p["bg"], foreground=p["fg"], indicatorbackground=p["field"], indicatorforeground=p["fg"])
+            st.map("TCheckbutton", background=[("active", p["bg"])], indicatorbackground=[("pressed", p["btn"]), ("!pressed", p["field"])])
+            st.configure("TScrollbar", background=p["btn"], troughcolor=p["bg"], bordercolor=p["bg"], arrowcolor=p["fg"])
+            st.map("TScrollbar", background=[("active", p["hover"])])
+            st.configure("TScale", background=p["btn"], troughcolor=p["field"], bordercolor=p["border"])
+            st.configure("TLabelframe", background=p["bg"], bordercolor=p["border"])
+            st.configure("TLabelframe.Label", background=p["bg"], foreground=p["fg"])
+        else:
+            st.theme_use(self.native_theme)
+            p = dict(LIGHT)
+            p["bg"] = self.default_bg
+        PAL.clear()
+        PAL.update(p)
+        self.root.configure(bg=p["bg"])
+        for lb in (self.avail, self.order):
+            lb.configure(bg=p["field"], fg=p["fg"], selectbackground=p["sel"], selectforeground=p["selfg"], highlightbackground=p["border"], highlightcolor=p["sel"], relief="flat")
+        self.logbox.configure(bg=p["field"], fg=p["fg"], insertbackground=p["fg"], selectbackground=p["sel"], selectforeground=p["selfg"], highlightbackground=p["border"], highlightcolor=p["sel"], relief="flat")
+        if self.settings_win is not None:
+            try:
+                self.settings_win.configure(bg=p["bg"])
+            except tk.TclError:
+                self.settings_win = None
+        self.save_settings()
+
+    def apply_options(self, save=True):
+        bot_mod.DELAY_MIN = float(self.delay_min.get())
+        bot_mod.DELAY_MAX = float(self.delay_max.get())
+        bot_mod.KNOW_DELAY = float(self.know_delay.get())
+        bot_mod.WRONG_MIN = int(self.wrong_min.get())
+        bot_mod.WRONG_MAX = int(self.wrong_max.get())
+        if save:
+            self.save_settings()
+
+    def fmt(self, val, unit):
+        if unit == "x":
+            return str(int(val)) + "x"
+        return ("%g" % val) + " s"
+
+    def add_slider(self, parent, row, name, text, var, lo, hi, step, unit):
+        ttk.Label(parent, text=text, width=6).grid(row=row, column=0, sticky="w", pady=2)
+        label = ttk.Label(parent, width=7, anchor="e")
+        scale = ttk.Scale(parent, from_=lo, to=hi, orient="horizontal", length=240, command=lambda v: self.slider_moved(name, v))
+        scale.grid(row=row, column=1, sticky="ew", padx=6, pady=2)
+        label.grid(row=row, column=2, pady=2)
+        self.sl[name] = (var, scale, label, step, unit)
+        scale.set(var.get())
+        label.configure(text=self.fmt(var.get(), unit))
+
+    def slider_moved(self, name, v):
+        if name not in self.sl:
+            return
+        var, scale, label, step, unit = self.sl[name]
+        val = round(float(v) / step) * step
+        val = round(val, 2)
+        if step >= 1:
+            val = int(val)
+        var.set(val)
+        label.configure(text=self.fmt(val, unit))
+        if self.building:
+            return
+        other = PAIRS.get(name)
+        if other and other in self.sl:
+            ovar, oscale = self.sl[other][0], self.sl[other][1]
+            if name.endswith("_min") and val > ovar.get():
+                oscale.set(val)
+            if name.endswith("_max") and val < ovar.get():
+                oscale.set(val)
+        self.apply_options()
+
+    def open_settings(self):
+        if self.settings_win is not None:
+            try:
+                self.settings_win.lift()
+                self.settings_win.focus_force()
+                return
+            except tk.TclError:
+                self.settings_win = None
+        w = tk.Toplevel(self.root)
+        w.title("Instellingen")
+        w.transient(self.root)
+        w.configure(bg=PAL["bg"])
+        w.protocol("WM_DELETE_WINDOW", self.close_settings)
+        self.settings_win = w
+        f = ttk.Frame(w, padding=14)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+        self.sl = {}
+        self.building = True
+        ttk.Label(f, text="Wachttijd per antwoord (willekeurig tussen min en max)").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.add_slider(f, 1, "delay_min", "min", self.delay_min, 0, 30, 0.5, "s")
+        self.add_slider(f, 2, "delay_max", "max", self.delay_max, 0, 30, 0.5, "s")
+        ttk.Label(f, text="Wachttijd bij 'ik ken het' kaarten").grid(row=3, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.add_slider(f, 4, "know_delay", "", self.know_delay, 0, 5, 0.1, "s")
+        ttk.Label(f, text="Bewust fout per kaart (willekeurig aantal, 0 = uit)").grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.add_slider(f, 6, "wrong_min", "min", self.wrong_min, 0, 10, 1, "x")
+        self.add_slider(f, 7, "wrong_max", "max", self.wrong_max, 0, 10, 1, "x")
+        ttk.Button(f, text="Sluiten", command=self.close_settings).grid(row=8, column=0, columnspan=3, pady=(14, 0))
+        self.building = False
+
+    def close_settings(self):
+        if self.settings_win is not None:
+            try:
+                self.settings_win.destroy()
+            except tk.TclError:
+                pass
+        self.settings_win = None
 
     def refresh_lists(self):
         self.avail.delete(0, "end")
@@ -296,18 +459,25 @@ class App:
             return 1
 
     def save_settings(self):
-        data = {
-            "url": self.url.get().strip(),
-            "order": list(self.order.get(0, "end")),
-            "first_card": self.get_first(),
-        }
         try:
+            data = {
+                "url": self.url.get().strip(),
+                "order": list(self.order.get(0, "end")),
+                "first_card": self.get_first(),
+                "delay_min": float(self.delay_min.get()),
+                "delay_max": float(self.delay_max.get()),
+                "know_delay": float(self.know_delay.get()),
+                "wrong_min": int(self.wrong_min.get()),
+                "wrong_max": int(self.wrong_max.get()),
+                "dark": bool(self.dark.get()),
+            }
             with open(SETTINGS, "w", encoding="utf-8") as f:
                 json.dump(data, f)
-        except OSError:
+        except (OSError, tk.TclError, AttributeError):
             pass
 
     def log(self, text):
+        bot_mod.file_log(text)
         self.q.put(("log", str(text)))
 
     def ask(self, kind, *payload):
@@ -418,6 +588,7 @@ class App:
         except Exception as e:
             lines = str(e).splitlines()
             self.log("update mislukt: " + (lines[0] if lines else type(e).__name__))
+            bot_mod.file_log(traceback.format_exc())
             self.q.put(("upd", rel, "update mislukt, probeer opnieuw"))
             return
         self.q.put(("updated", res))
@@ -470,6 +641,7 @@ class App:
             except Exception as e:
                 lines = str(e).splitlines()
                 self.log("fout: " + (lines[0] if lines else type(e).__name__))
+                bot_mod.file_log(traceback.format_exc())
                 self.q.put(("status", "chrome starten mislukt"))
             self.q.put(("idle",))
 
@@ -513,6 +685,7 @@ class App:
         except Exception as e:
             lines = str(e).splitlines()
             self.log("fout: " + (lines[0] if lines else type(e).__name__))
+            bot_mod.file_log(traceback.format_exc())
             self.q.put(("status", "fout, zie log"))
         self.q.put(("idle",))
 
@@ -532,6 +705,7 @@ class App:
         if self.pending is not None:
             self.pending.put(None)
         self.save_settings()
+        bot_mod.file_log("sessie einde")
         bot_mod.close()
         self.root.destroy()
 

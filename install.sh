@@ -55,6 +55,26 @@ if ! TKV="$("$PY" -c 'import tkinter; print(tkinter.TkVersion)' 2>/dev/null)"; t
   exec bash "$0" "$@"
 fi
 
+if [ "$OS" = "Linux" ]; then
+  case "$(uname -m)" in
+    aarch64|arm*)
+      if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1; then
+        echo "arm: chrome for testing bestaat niet voor arm, ik gebruik chromium van je systeem."
+        if command -v apt >/dev/null 2>&1; then
+          echo "commando: sudo apt install -y chromium chromium-driver"
+          read -r -p "nu uitvoeren? (j/n) " A
+          if [ "$A" = "j" ]; then
+            sudo apt install -y chromium chromium-driver || sudo apt install -y chromium-browser chromium-chromedriver
+          fi
+        else
+          echo "installeer chromium en chromedriver met je pakketbeheerder en start dit opnieuw."
+          exit 1
+        fi
+      fi
+      ;;
+  esac
+fi
+
 if [ "$OS" = "Darwin" ] && ! awk "BEGIN{exit !($TKV >= 8.6)}"; then
   echo "je python heeft een te oude Tk ($TKV). installeer python van https://www.python.org/downloads/macos/"
   exit 1

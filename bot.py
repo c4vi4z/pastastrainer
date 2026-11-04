@@ -1,4 +1,4 @@
-import os, sys, re, time, stat, platform, zipfile, shutil, ssl, subprocess, random
+import os, sys, re, time, stat, platform, zipfile, shutil, ssl, subprocess, random, threading, traceback
 import urllib.request, urllib.error
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
@@ -30,13 +30,18 @@ else:
     PARENT = os.path.dirname(BASE)
 LISTS_DIR = os.path.join(BASE, "lists")
 PROFILE = os.path.join(PARENT, "chrome-profile")
+LOG_PATH = os.path.join(PARENT, "memorybot.log")
 os.makedirs(LISTS_DIR, exist_ok=True)
 
 SKIP = "-- sla kaart over --"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 INSTALLER_API = 99
+
 DELAY_MIN = 1
 DELAY_MAX = 10
+KNOW_DELAY = 0.2
+WRONG_MIN = 1
+WRONG_MAX = 10
 
 
 def seed_lists():
@@ -65,13 +70,16 @@ stop = None
 driver = None
 all_words = {}
 
+SYSTEM_BROWSER = False
 system = platform.system()
 machine = platform.machine().lower()
 arm = machine in ("arm64", "aarch64")
 if system == "Linux":
-    if arm:
-        raise RuntimeError("linux op arm wordt niet ondersteund (geen chrome for testing build)")
-    PLAT = "linux64"
+    if arm or machine.startswith("arm"):
+        SYSTEM_BROWSER = True
+        PLAT = "linux-arm"
+    else:
+        PLAT = "linux64"
 elif system == "Darwin":
     PLAT = "mac-arm64" if arm else "mac-x64"
 elif system == "Windows":
@@ -80,6 +88,7 @@ else:
     raise RuntimeError("niet ondersteund os: " + system)
 
 IS_WIN = PLAT.startswith("win")
+NOWIN = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
 
 if PLAT.startswith("mac"):
     CHROME_REL = os.path.join("Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing")
@@ -98,6 +107,76 @@ class Stopped(Exception):
     pass
 
 
+def file_log(text):
+    try:
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1000000:
+            old = LOG_PATH + ".old"
+            if os.path.exists(old):
+                os.remove(old)
+            os.replace(LOG_PATH, old)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(text) + "\n")
+    except Exception:
+        pass
+
+
+dbg = file_log
+
+
+def tail_file(path, n):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.readlines()[-n:]
+    except OSError:
+        return []
+
+
+def hook_threads():
+    def hook(args):
+        file_log("thread fout: " + "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+    threading.excepthook = hook
+
+
+def debug_info():
+    try:
+        file_log("==== sessie start ====")
+        file_log("versie " + APP_VERSION + ", installer api " + str(INSTALLER_API))
+        file_log("os " + platform.platform() + ", machine " + platform.machine())
+        if system == "Darwin":
+            file_log("macos " + platform.mac_ver()[0])
+        file_log("python " + sys.version.split()[0] + ", frozen " + str(FROZEN))
+        file_log("plat " + PLAT + ", systeem browser " + str(SYSTEM_BROWSER))
+        file_log("BASE " + BASE)
+        file_log("PARENT " + PARENT)
+        file_log("chrome " + CHROME_BIN + " bestaat " + str(os.path.exists(CHROME_BIN)))
+        file_log("driver " + DRIVER_BIN + " bestaat " + str(os.path.exists(DRIVER_BIN)))
+        file_log("profiel " + PROFILE + " bestaat " + str(os.path.isdir(PROFILE)))
+        file_log("lijsten " + str(len(find_lists())))
+        file_log("wachttijd " + str(DELAY_MIN) + "-" + str(DELAY_MAX) + "s, ik ken het " + str(KNOW_DELAY) + "s, fout per kaart " + str(WRONG_MIN) + "-" + str(WRONG_MAX))
+    except Exception as e:
+        file_log("debug info mislukt: " + type(e).__name__)
+
+
+def log_versions():
+    for path in (CHROME_BIN, DRIVER_BIN):
+        if IS_WIN and path == CHROME_BIN:
+            continue
+        name = os.path.basename(path)
+        try:
+            out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, creationflags=NOWIN)
+            file_log("versie " + name + ": " + (out.stdout.strip() or out.stderr.strip()))
+        except subprocess.TimeoutExpired:
+            file_log("versie " + name + ": timeout na 15s")
+        except Exception as e:
+            file_log("versie " + name + " fout: " + type(e).__name__ + " " + str(e))
+    if not IS_WIN:
+        try:
+            out = subprocess.run(["file", CHROME_BIN], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+            file_log("file: " + out.stdout.strip())
+        except Exception:
+            pass
+
+
 def check():
     if stop.is_set():
         raise Stopped()
@@ -109,8 +188,11 @@ def pause(secs):
         check()
         time.sleep(0.1)
 
+
 def word_delay():
-    pause(random.uniform(DELAY_MIN, DELAY_MAX))
+    lo = min(DELAY_MIN, DELAY_MAX)
+    hi = max(DELAY_MIN, DELAY_MAX)
+    pause(random.uniform(lo, hi))
 
 
 def extract_zip(zip_path, dest):
@@ -173,7 +255,39 @@ def download(name, check_path):
     os.remove(zip_path)
 
 
+def find_system_browser():
+    browser = None
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        p = shutil.which(name)
+        if p:
+            browser = p
+            break
+    drv = None
+    for name in ("chromedriver", "chromium-chromedriver"):
+        p = shutil.which(name)
+        if p:
+            drv = p
+            break
+    if drv is None:
+        for p in ("/usr/lib/chromium/chromedriver", "/usr/lib/chromium-browser/chromedriver", "/usr/lib64/chromium/chromedriver"):
+            if os.path.exists(p):
+                drv = p
+                break
+    return browser, drv
+
+
 def ensure_browser():
+    global CHROME_BIN, DRIVER_BIN
+    if SYSTEM_BROWSER:
+        browser, drv = find_system_browser()
+        if not browser or not drv:
+            raise RuntimeError(
+                "chromium of chromedriver ontbreekt. installeer met: sudo apt install chromium chromium-driver "
+                "(of: sudo apt install chromium-browser chromium-chromedriver)"
+            )
+        CHROME_BIN = browser
+        DRIVER_BIN = drv
+        return
     download("chrome", CHROME_BIN)
     download("chromedriver", DRIVER_BIN)
     if not IS_WIN:
@@ -312,28 +426,34 @@ def kill_old_chrome():
             )
             subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW, timeout=20,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NOWIN, timeout=20,
             )
         else:
-            subprocess.run(["pkill", "-f", CHROME_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-    except Exception:
-        pass
+            subprocess.run(["pkill", "-f", PROFILE], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except Exception as e:
+        file_log("oude chrome opruimen mislukt: " + type(e).__name__)
 
 
 def open_browser(url):
     global driver
     if not alive():
         ensure_browser()
+        file_log("browser start, chrome " + CHROME_BIN)
+        log_versions()
         opts = Options()
         opts.binary_location = CHROME_BIN
         opts.add_argument("--user-data-dir=" + PROFILE)
         opts.add_argument("--lang=nl")
         opts.add_argument("--force-device-scale-factor=1")
         opts.add_argument("--start-maximized")
+        if SYSTEM_BROWSER:
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
         opts.add_experimental_option("prefs", {"intl.accept_languages": "nl,nl-NL,en"})
         last_err = None
         for attempt in range(2):
+            file_log("poging " + str(attempt + 1))
             kill_old_chrome()
             clean_locks()
             time.sleep(1)
@@ -345,15 +465,19 @@ def open_browser(url):
             except Exception as e:
                 driver = None
                 last_err = e
+                file_log("chrome start fout: " + type(e).__name__ + " " + str(e)[:600])
+                for line in tail_file(os.path.join(BASE, "chromedriver.log"), 25):
+                    file_log("  chromedriver.log: " + line.rstrip())
                 log("chrome start mislukt, opnieuw proberen...")
         if last_err is not None:
             raise RuntimeError(
-                "chrome starten mislukt. details in chromedriver.log (" + type(last_err).__name__ + ")"
+                "chrome starten mislukt. details in memorybot.log (" + type(last_err).__name__ + ")"
             )
         try:
             driver.maximize_window()
         except Exception:
             pass
+        file_log("browser open")
     driver.get(url)
 
 
@@ -482,7 +606,7 @@ def card_title(card):
         return "?"
 
 
-def get_card(index, timeout=40):
+def get_card(index, timeout=60):
     end = time.time() + timeout
     stuck = 0
     count = -1
@@ -493,7 +617,7 @@ def get_card(index, timeout=40):
             return cards[index], len(cards)
         if len(cards) == count:
             stuck += 1
-            if stuck >= 4:
+            if stuck >= 12:
                 break
         else:
             stuck = 0
@@ -507,17 +631,21 @@ def get_card(index, timeout=40):
     return None, len(visible_cards())
 
 
-def back_to_cards(timeout=25):
-    end = time.time() + timeout
+def back_to_cards(timeout=40):
+    start = time.time()
+    end = start + timeout
     while time.time() < end:
         check()
         if visible_cards():
             return True
+        if time.time() - start < 8:
+            pause(0.5)
+            continue
         back = first_visible(BACK_BTN)
         if back:
             click(back)
             log("terug")
-            pause(1.5)
+            pause(2.5)
         else:
             pause(0.5)
     return False
@@ -540,6 +668,7 @@ def wait_for_exercise(timeout=25):
         pause(0.5)
     return False
 
+
 def dump_debug(why):
     try:
         log("debug: " + why)
@@ -561,9 +690,10 @@ def dump_debug(why):
 
 def enter_lesson(step, first):
     if first and in_exercise():
+        dbg("al in een oefening, kaart openen overgeslagen")
         return True
     if not back_to_cards():
-        log("geen kaarten gevonden op de pagina")
+        log("geen kaarten gevonden. ga in chrome naar de pagina met de lessenkaarten (open eerst een unit) en klik Start opnieuw")
         dump_debug("geen kaarten na terug klikken")
         return False
 
@@ -581,29 +711,96 @@ def enter_lesson(step, first):
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
     click(target)
     pause(1)
-    return wait_for_exercise()
+    ok = wait_for_exercise()
+    dbg("oefening gestart: " + str(ok))
+    return ok
 
-def enter_lesson(step, first):
-    if first and in_exercise():
-        return True
-    if not back_to_cards():
-        log("geen kaarten gevonden op de pagina")
-        return False
 
-    card, total = get_card(step["card"])
-    if card is None:
-        log("kaart " + str(step["card"] + 1) + " bestaat niet (" + str(total) + " kaarten gevonden), stop")
-        return False
+def advance(cue):
+    end = time.time() + 4
+    while time.time() < end:
+        nb = next_button()
+        if nb:
+            click(nb)
+            log("volgende")
+            break
+        pause(0.3)
+    for t in range(10):
+        pause(0.3)
+        try:
+            if norm(get_cue()) != cue:
+                return
+        except Exception:
+            return
 
-    log("open kaart " + str(step["card"] + 1) + " van " + str(total) + ": " + card_title(card))
-    try:
-        target = card.find_element(*CARD_INNER)
-    except NoSuchElementException:
-        target = card
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
-    click(target)
-    pause(1)
-    return wait_for_exercise()
+
+def pick_wrong_count():
+    lo = int(min(WRONG_MIN, WRONG_MAX))
+    hi = int(max(WRONG_MIN, WRONG_MAX))
+    if hi <= 0:
+        return 0
+    return random.randint(max(lo, 0), hi)
+
+
+def wrong_answers(count, dicts):
+    done = 0
+    tries = 0
+    while done < count and tries < count * 4 + 8:
+        tries += 1
+        check()
+        try:
+            if stop_button():
+                return
+            kb = know_button()
+            if kb:
+                click(kb)
+                log("ik ken het")
+                pause(KNOW_DELAY)
+                continue
+            try:
+                cue = norm(get_cue())
+            except StaleElementReferenceException:
+                raise
+            except Exception:
+                cue = ""
+            if not cue:
+                pause(0.5)
+                continue
+            options = mc_options()
+            if options:
+                good = pick_option(cue, options, dicts)
+                choices = [i for i in range(len(options)) if i != good]
+                if not choices:
+                    return
+                idx = random.choice(choices)
+                click(options[idx][0])
+                log(cue + " -> " + options[idx][1] + " (bewust fout, mc)")
+            else:
+                box = driver.find_element(*ANSWER)
+                box.click()
+                box.send_keys(Keys.ENTER)
+                pause(1)
+                if not next_button():
+                    try:
+                        same = norm(get_cue()) == cue
+                    except Exception:
+                        same = False
+                    if same:
+                        dbg("enter zonder tekst deed niks, x typen")
+                        box.send_keys("x")
+                        box.send_keys(Keys.ENTER)
+                log(cue + " (bewust fout)")
+            done += 1
+            word_delay()
+            advance(cue)
+        except (StaleElementReferenceException, NoSuchElementException):
+            nb = next_button()
+            if nb:
+                click(nb)
+                done += 1
+            pause(0.3)
+            continue
+    dbg("bewust fout klaar: " + str(done) + " van " + str(count))
 
 
 def run_lesson(step):
@@ -611,6 +808,12 @@ def run_lesson(step):
     wait = WebDriverWait(driver, 15)
     last = None
     idle = 0
+
+    n = pick_wrong_count()
+    dbg("kaart " + step["label"] + ": " + str(n) + " keer bewust fout")
+    if n > 0:
+        wrong_answers(n, dicts)
+
     while idle < 30:
         check()
         try:
@@ -627,7 +830,7 @@ def run_lesson(step):
                 log("ik ken het")
                 last = None
                 idle = 0
-                pause(0.5)
+                pause(KNOW_DELAY)
                 continue
 
             try:
@@ -642,6 +845,7 @@ def run_lesson(step):
                 if options:
                     idx = pick_option(cue, options, dicts)
                     if idx is None:
+                        dbg("geen match voor '" + cue + "', opties: " + " | ".join(o[1] for o in options))
                         idx = ask_mc(cue, [o[1] for o in options])
                         if idx is None:
                             return "quit"
@@ -658,6 +862,7 @@ def run_lesson(step):
 
                 answer = lookup(cue, dicts)
                 if answer is None:
+                    dbg("'" + cue + "' niet in lijst")
                     answer = ask_open(cue)
                     if answer is None:
                         return "quit"
@@ -695,8 +900,21 @@ def run_lesson(step):
             continue
 
         idle += 1
+        if idle % 10 == 0:
+            dbg("niks te doen, idle " + str(idle) + ", cue '" + str(last) + "'")
         pause(0.5)
     return "idle"
+
+
+def dbg_page():
+    try:
+        dbg("url " + driver.current_url)
+        dbg("titel " + driver.title)
+        size = driver.get_window_size()
+        dbg("venster " + str(size["width"]) + "x" + str(size["height"]) + ", taal " + str(driver.execute_script("return navigator.language")))
+        dbg("kaarten zichtbaar " + str(len(visible_cards())))
+    except Exception as e:
+        dbg("pagina info mislukt: " + type(e).__name__)
 
 
 def run(steps):
@@ -707,6 +925,8 @@ def run(steps):
     for s in steps:
         for k, v in s["words"].items():
             all_words.setdefault(k, v)
+    dbg("run start, " + str(len(steps)) + " kaarten, " + str(len(all_words)) + " woorden")
+    dbg_page()
     try:
         for n in range(len(steps)):
             step = steps[n]
@@ -715,11 +935,13 @@ def run(steps):
                 log("kaart openen mislukt, stop")
                 return "error"
             result = run_lesson(step)
+            dbg("resultaat " + step["label"] + ": " + result)
             if result == "finished":
                 log(step["label"] + " klaar")
                 continue
             if result == "idle":
                 log("niks meer gezien, stop")
+                dbg_page()
             else:
                 log("gestopt")
             return result
